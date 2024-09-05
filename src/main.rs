@@ -65,6 +65,7 @@ impl Message {
         let mut message: [u8; 512] = [0; 512];
         self.header.answer_record_count = self.header.question_count;
         self.header.qr_indicator = true;
+        self.header.r_code = if self.header.opcode == 0 { 0 } else { 4 };
         let header = self.header.write().unwrap();
         for (index, byte) in header.iter().enumerate() {
             message[index] = byte.to_owned()
@@ -143,10 +144,10 @@ impl Header {
         writer.write_u8(self.opcode, 4)?;
         writer.write_bool(self.aa)?;
         writer.write_bool(self.truncation)?;
-        writer.write_bool(false)?; // recursion_desired
+        writer.write_bool(self.recursion_desired)?; // recursion_desired
         writer.write_bool(false)?; //recursion_available
         writer.write_u8(0, 3)?; // reserved
-        writer.write_u8(0, 4)?; // r_code
+        writer.write_u8(self.r_code, 4)?; // r_code
         writer.write_u16(self.question_count, 16)?; // question count
         writer.write_u16(self.answer_record_count, 16)?;
         writer.write_u16(self.authoritative_record_count, 16)?;
