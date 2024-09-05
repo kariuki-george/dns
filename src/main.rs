@@ -1,10 +1,11 @@
-use std::io::{Cursor, Read};
+use std::io::{BufRead, Cursor, Read};
 #[allow(unused_imports)]
 use std::net::UdpSocket;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bitreader::BitReader;
 use bitvec::{prelude::*, view::BitView};
+use bytes::Buf;
 use rust_bitwriter::BitWriter;
 
 fn main() {
@@ -36,7 +37,7 @@ fn main() {
 #[derive(Debug, Default)]
 struct Message {
     header: Header,
-    question: String,
+    questions: Vec<Question>,
     answer: String,
     authority: String,
     space: String,
@@ -44,22 +45,34 @@ struct Message {
 
 impl Message {
     fn new(buf: [u8; 512]) -> Self {
-        let mut cursor = Cursor::new(buf);
-        let header = Header::parse(&mut cursor).unwrap();
-
-        Message {
-            header,
+        let mut message = Message {
             ..Default::default()
+        };
+        let mut cursor = Cursor::new(buf);
+        message.header = Header::parse(&mut cursor).unwrap();
+
+        for _ in 0..message.header.question_count {
+            let question = Question::parse(&mut cursor).unwrap();
+            message.questions.push(question);
         }
+
+        message
     }
 
     fn write(&self) -> [u8; 512] {
-        let header = self.header.write().unwrap();
-
         let mut message: [u8; 512] = [0; 512];
-
+        let header = self.header.write().unwrap();
         for (index, byte) in header.iter().enumerate() {
             message[index] = byte.to_owned()
+        }
+
+        let mut position = 12;
+        for question in &self.questions {
+            let question = question.write().unwrap();
+            for byte in question {
+                message[position] = byte.to_owned();
+                position += 1;
+            }
         }
 
         message
@@ -103,10 +116,10 @@ impl Header {
         header.recursion_available = reader.read_bool()?;
         header.reserved = reader.read_u8(3)?;
         header.r_code = reader.read_u8(4)?;
-        header.question_count = reader.read_u16(2)?;
-        header.answer_record_count = reader.read_u16(2)?;
-        header.authoritative_record_count = reader.read_u16(2)?;
-        header.additional_record_count = reader.read_u16(2)?;
+        header.question_count = reader.read_u16(16)?;
+        header.answer_record_count = reader.read_u16(16)?;
+        header.authoritative_record_count = reader.read_u16(16)?;
+        header.additional_record_count = reader.read_u16(16)?;
 
         Ok(header)
     }
@@ -123,7 +136,7 @@ impl Header {
         writer.write_bool(false)?; //recursion_available
         writer.write_u8(0, 3)?; // reserved
         writer.write_u8(0, 4)?; // r_code
-        writer.write_u16(0, 16)?; // question count
+        writer.write_u16(self.question_count, 16)?; // question count
         writer.write_u16(self.answer_record_count, 16)?;
         writer.write_u16(self.authoritative_record_count, 16)?;
         writer.write_u16(self.additional_record_count, 16)?;
@@ -138,9 +151,67 @@ impl Header {
     }
 }
 
-fn u16_to_u8s(input: u16) -> (u8, u8) {
-    let upper_byte = (input >> 8) as u8;
-    let lower_byte = input as u8;
+#[derive(Debug, Default)]
+struct Question {
+    names: Vec<String>,
+    q_type: u16,
+    class: u16,
+}
 
-    (upper_byte, lower_byte)
+impl Question {
+    fn parse(cursor: &mut Cursor<[u8; 512]>) -> Result<Self> {
+        let mut buffer = Vec::new();
+
+        cursor
+            .read_until(0, &mut buffer)
+            .context("Failed to read question buffer")?;
+
+        // Parse labels
+        let mut label_cursor = Cursor::new(buffer);
+
+        let mut question = Question {
+            ..Default::default()
+        };
+
+        let mut labels = Vec::new();
+        loop {
+            let position = label_cursor.position() as usize;
+            if label_cursor.get_ref()[position] == b'\0' {
+                break;
+            }
+            let length = label_cursor.get_u8();
+
+            let mut label_buf: Vec<u8> = vec![0; length.into()];
+
+            label_cursor
+                .read_exact(&mut label_buf)
+                .context("Failed to read label buffer")?;
+
+            let label = String::from_utf8(label_buf)?;
+            labels.push(label);
+        }
+        question.names = labels;
+        let q_type = cursor.get_u16();
+        let class = cursor.get_u16();
+        question.q_type = q_type;
+        question.class = class;
+
+        Ok(question)
+    }
+    fn write(&self) -> Result<Vec<u8>> {
+        let mut question = Vec::new();
+        for label in &self.names {
+            let length: u8 = label
+                .len()
+                .try_into()
+                .context("Question label was more than 255 characters long")?;
+
+            question.push(length);
+            question = [question, label.as_bytes().to_vec()].concat();
+        }
+        question.push(b'\0');
+        question = [question, self.q_type.to_be_bytes().to_vec()].concat();
+        question = [question, self.class.to_be_bytes().to_vec()].concat();
+        Ok(question)
+    }
 }
