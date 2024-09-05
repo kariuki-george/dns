@@ -19,10 +19,12 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                let message = Message::new(buf);
+                let mut message = Message::new(buf);
                 println!("{:?}", message);
 
                 let response = message.write();
+                println!("{:?}", response);
+
                 udp_socket
                     .send_to(&response, source)
                     .expect("Failed to send response");
@@ -38,7 +40,7 @@ fn main() {
 struct Message {
     header: Header,
     questions: Vec<Question>,
-    answer: String,
+
     authority: String,
     space: String,
 }
@@ -59,8 +61,10 @@ impl Message {
         message
     }
 
-    fn write(&self) -> [u8; 512] {
+    fn write(&mut self) -> Vec<u8> {
         let mut message: [u8; 512] = [0; 512];
+        self.header.answer_record_count = self.header.question_count;
+        self.header.qr_indicator = true;
         let header = self.header.write().unwrap();
         for (index, byte) in header.iter().enumerate() {
             message[index] = byte.to_owned()
@@ -68,14 +72,21 @@ impl Message {
 
         let mut position = 12;
         for question in &self.questions {
-            let question = question.write().unwrap();
+            let question = question.write(false).unwrap();
+            for byte in question {
+                message[position] = byte.to_owned();
+                position += 1;
+            }
+        }
+        for question in &self.questions {
+            let question = question.write(true).unwrap();
             for byte in question {
                 message[position] = byte.to_owned();
                 position += 1;
             }
         }
 
-        message
+        message[0..position].to_vec()
     }
 }
 
@@ -128,8 +139,8 @@ impl Header {
         let mut writer = BitWriter::new();
 
         writer.write_u16(self.packet_id, 16)?;
-        writer.write_bool(true)?;
-        writer.write_u8(0, 4)?;
+        writer.write_bool(self.qr_indicator)?;
+        writer.write_u8(self.opcode, 4)?;
         writer.write_bool(self.aa)?;
         writer.write_bool(self.truncation)?;
         writer.write_bool(false)?; // recursion_desired
@@ -198,7 +209,7 @@ impl Question {
 
         Ok(question)
     }
-    fn write(&self) -> Result<Vec<u8>> {
+    fn write(&self, is_answer: bool) -> Result<Vec<u8>> {
         let mut question = Vec::new();
         for label in &self.names {
             let length: u8 = label
@@ -212,6 +223,23 @@ impl Question {
         question.push(b'\0');
         question = [question, self.q_type.to_be_bytes().to_vec()].concat();
         question = [question, self.class.to_be_bytes().to_vec()].concat();
+        println!("{:?}", question);
+
+        if is_answer {
+            let ttl: u32 = 60;
+            let length: u16 = 4;
+            let data: [u8; 4] = [10; 4];
+
+            question = [question, ttl.to_be_bytes().to_vec()].concat();
+            question = [question, length.to_be_bytes().to_vec()].concat();
+
+            for section in data {
+                question.push(section);
+            }
+        }
+
+        println!("{:?}", question);
+
         Ok(question)
     }
 }
