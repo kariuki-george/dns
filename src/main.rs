@@ -1,6 +1,9 @@
-use std::io::{BufRead, Cursor, Read};
 #[allow(unused_imports)]
 use std::net::UdpSocket;
+use std::{
+    io::{BufRead, Cursor, Read, Seek},
+    usize,
+};
 
 use anyhow::{Context, Result};
 use bitreader::BitReader;
@@ -172,42 +175,74 @@ struct Question {
 
 impl Question {
     fn parse(cursor: &mut Cursor<[u8; 512]>) -> Result<Self> {
-        let mut buffer = Vec::new();
+        // let mut buffer = Vec::new();
+        //
+        // cursor
+        //     .read_until(0, &mut buffer)
+        //     .context("Failed to read question buffer")?;
+        //
+        // // Parse labels
+        // let mut label_cursor = Cursor::new(buffer);
+        //
+        // let mut question = Question {
+        //     ..Default::default()
+        // };
+        //
+        // let mut labels = Vec::new();
+        // loop {
+        //     let position = label_cursor.position() as usize;
+        //     if label_cursor.get_ref()[position] == b'\0' {
+        //         break;
+        //     }
+        //     let length = label_cursor.get_u8();
+        //
+        //     let d = [length];
+        //     let mut reader = BitReader::new(&d);
+        //
+        //     let distinguisher = reader.read_u8(2)?;
+        //
+        //     if distinguisher == 11 {
+        //         // Compressed label
+        //         let octet_2 = cursor.get_u8();
+        //         let offset = [reader.read_u8(6)?, octet_2];
+        //
+        //         let cursor_position = cursor.position();
 
-        cursor
-            .read_until(0, &mut buffer)
-            .context("Failed to read question buffer")?;
-
-        // Parse labels
-        let mut label_cursor = Cursor::new(buffer);
-
-        let mut question = Question {
-            ..Default::default()
-        };
-
-        let mut labels = Vec::new();
-        loop {
-            let position = label_cursor.position() as usize;
-            if label_cursor.get_ref()[position] == b'\0' {
-                break;
-            }
-            let length = label_cursor.get_u8();
-
-            let mut label_buf: Vec<u8> = vec![0; length.into()];
-
-            label_cursor
-                .read_exact(&mut label_buf)
-                .context("Failed to read label buffer")?;
-
-            let label = String::from_utf8(label_buf)?;
-            labels.push(label);
-        }
-        question.names = labels;
-        let q_type = cursor.get_u16();
-        let class = cursor.get_u16();
-        question.q_type = q_type;
-        question.class = class;
-
+        //         let prev_label = u16::from_be_bytes(offset);
+        //
+        //         cursor.set_position(prev_label.into());
+        //         let length = cursor.get_u8();
+        //         let mut label_buf: Vec<u8> = vec![0; length.into()];
+        //
+        //         label_cursor
+        //             .read_exact(&mut label_buf)
+        //             .context("Failed to read label buffer")?;
+        //
+        //         let label = String::from_utf8(label_buf)?;
+        //         labels.push(label);
+        //     } else {
+        //         // NOTE: This handles uncompressed labels
+        //         // Messages having 10 and 01 bits combination will be handled here. not to panic as they
+        //         // are currently restricted for future use.
+        //
+        //         // Uncompressed label
+        //
+        //         let mut label_buf: Vec<u8> = vec![0; length.into()];
+        //
+        //         label_cursor
+        //             .read_exact(&mut label_buf)
+        //             .context("Failed to read label buffer")?;
+        //
+        //         let label = String::from_utf8(label_buf)?;
+        //         labels.push(label);
+        //     }
+        // }
+        // question.names = labels;
+        // let q_type = cursor.get_u16();
+        // let class = cursor.get_u16();
+        // question.q_type = q_type;
+        // question.class = class;
+        let question = parse_question(cursor)?;
         Ok(question)
     }
     fn write(&self, is_answer: bool) -> Result<Vec<u8>> {
@@ -224,7 +259,6 @@ impl Question {
         question.push(b'\0');
         question = [question, self.q_type.to_be_bytes().to_vec()].concat();
         question = [question, self.class.to_be_bytes().to_vec()].concat();
-        println!("{:?}", question);
 
         if is_answer {
             let ttl: u32 = 60;
@@ -239,8 +273,57 @@ impl Question {
             }
         }
 
-        println!("{:?}", question);
-
         Ok(question)
     }
+}
+fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<String> {
+    // Check if pointer
+    let octet_1 = cursor.get_u8();
+    let octet_1 = [octet_1];
+    let mut reader = BitReader::new(&octet_1);
+    let distinguisher = reader.read_u8(2)?;
+    if distinguisher == 3 {
+        // Compressed
+        let octet_2 = cursor.get_u8();
+        let offset = [reader.read_u8(6)?, octet_2];
+        let offset = u16::from_be_bytes(offset);
+        let cursor_position = cursor.position();
+
+        cursor.set_position(offset.into());
+        let label = parse_label(cursor)?;
+        cursor.set_position(cursor_position);
+        Ok(label)
+    } else {
+        //NOTE: Other including Uncompressed and reserved 01, 10
+        //Implements only the uncompressed
+        let length = u8::from_be_bytes(octet_1);
+        let mut label_buf: Vec<u8> = vec![0; length.into()];
+
+        cursor
+            .read_exact(&mut label_buf)
+            .context("Failed to read label buffer")?;
+
+        let label = String::from_utf8(label_buf)?;
+        Ok(label)
+    }
+}
+
+fn parse_question(cursor: &mut Cursor<[u8; 512]>) -> Result<Question> {
+    let mut question = Question::default();
+    loop {
+        let position = cursor.position() as usize;
+        if cursor.get_ref()[position] == b'\0' {
+            break;
+        }
+        let label = parse_label(cursor)?;
+        question.names.push(label);
+    }
+    // Read the null byte
+    cursor.get_u8();
+    let q_type = cursor.get_u16();
+    let class = cursor.get_u16();
+    question.q_type = q_type;
+    question.class = class;
+
+    Ok(question)
 }
