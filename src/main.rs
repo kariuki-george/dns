@@ -1,32 +1,47 @@
-#[allow(unused_imports)]
 use std::net::UdpSocket;
+use std::usize;
 use std::{
-    io::{BufRead, Cursor, Read, Seek},
-    usize,
+    env::args,
+    io::{Cursor, Read},
 };
 
 use anyhow::{Context, Result};
 use bitreader::BitReader;
-use bitvec::{prelude::*, view::BitView};
 use bytes::Buf;
 use rust_bitwriter::BitWriter;
 
 fn main() {
     println!("Logs from your program will appear here!");
 
-    let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
+    let udp_socket = UdpSocket::bind("0.0.0.0:2053").expect("Failed to bind to address");
     let mut buf = [0; 512];
+
+    let args = args();
+    let mut address = String::new();
+
+    if args.len() > 1 {
+        // Parse forwarding server
+        let addr = args
+            .into_iter()
+            .last()
+            .expect("Expected forwarding server addr");
+        address = addr.clone();
+        let _ = addr
+            .split_once(':')
+            .expect("Expected address to be of <addr>:<port> format");
+    }
 
     loop {
         match udp_socket.recv_from(&mut buf) {
-            Ok((size, source)) => {
-                println!("Received {} bytes from {}", size, source);
+            Ok((_size, source)) => {
+                let message = Message::new(buf, false);
 
-                let mut message = Message::new(buf);
-                println!("{:?}", message);
-
-                let response = message.write();
-                println!("{:?}", response);
+                let mut response = message.clone().write(true);
+                if !address.is_empty() {
+                    // let mut message = forward_query(&udp_socket, &address, message).unwrap();
+                    let mut message = make_codecrafters_happy(&udp_socket, &address, message);
+                    response = message.write(true);
+                }
 
                 udp_socket
                     .send_to(&response, source)
@@ -39,36 +54,96 @@ fn main() {
         }
     }
 }
-#[derive(Debug, Default)]
+
+fn make_codecrafters_happy(udp: &UdpSocket, addr: &str, message: Message) -> Message {
+    println!("{:?}", message);
+    let mut answer_questions = vec![];
+    let mut response = Message::default();
+
+    for question in 0..message.header.question_count {
+        let mut to_send_question = Message::default();
+        to_send_question.header = message.header.clone();
+        to_send_question.header.packet_id = question;
+        to_send_question.header.question_count = 1;
+        to_send_question
+            .questions
+            .push(message.questions[question as usize].clone());
+
+        println!("To push question. {:?}", to_send_question);
+
+        let response = forward_query(udp, addr, to_send_question).unwrap();
+
+        println!("\nsome response. {:?}", response);
+
+        answer_questions.push(response);
+    }
+    // Assumes all went well
+    response.header = message.header.clone();
+    response.header.answer_record_count = message.header.question_count;
+    response.header.qr_indicator = true;
+    println!("{:?}", answer_questions);
+    for answer in 0..message.header.question_count {
+        let answer = answer_questions[0].clone();
+        response.questions = [response.questions, answer.questions].concat();
+        response.answers = [response.answers, answer.answers].concat();
+    }
+
+    println!("Response {:?}", response);
+    response
+}
+
+fn forward_query(udp: &UdpSocket, addr: &str, mut message: Message) -> Result<Message> {
+    let query = message.write(false);
+    udp.send_to(&query, addr)
+        .context("Failed to forward message")?;
+    let mut buf = [0; 512];
+
+    udp.recv_from(&mut buf)?;
+
+    let message = Message::new(buf, true);
+    Ok(message)
+}
+
+#[derive(Debug, Default, Clone)]
 struct Message {
     header: Header,
     questions: Vec<Question>,
-
-    authority: String,
-    space: String,
+    answers: Vec<Question>,
 }
 
 impl Message {
-    fn new(buf: [u8; 512]) -> Self {
+    fn new(buf: [u8; 512], is_answer: bool) -> Self {
         let mut message = Message {
             ..Default::default()
         };
         let mut cursor = Cursor::new(buf);
         message.header = Header::parse(&mut cursor).unwrap();
-
+        //Read questions
         for _ in 0..message.header.question_count {
-            let question = Question::parse(&mut cursor).unwrap();
+            let question = Question::parse(&mut cursor, false).unwrap();
+
             message.questions.push(question);
+        }
+
+        // Read Answers
+
+        if is_answer {
+            for _ in 0..message.header.answer_record_count {
+                let answer = Question::parse(&mut cursor, true).unwrap();
+                message.answers.push(answer);
+            }
         }
 
         message
     }
 
-    fn write(&mut self) -> Vec<u8> {
+    fn write(&mut self, is_response: bool) -> Vec<u8> {
         let mut message: [u8; 512] = [0; 512];
-        self.header.answer_record_count = self.header.question_count;
-        self.header.qr_indicator = true;
-        self.header.r_code = if self.header.opcode == 0 { 0 } else { 4 };
+        if is_response {
+            self.header.answer_record_count = self.header.question_count;
+            self.header.qr_indicator = true;
+            self.header.r_code = if self.header.opcode == 0 { 0 } else { 4 };
+        }
         let header = self.header.write().unwrap();
         for (index, byte) in header.iter().enumerate() {
             message[index] = byte.to_owned()
@@ -82,7 +157,7 @@ impl Message {
                 position += 1;
             }
         }
-        for question in &self.questions {
+        for question in &self.answers {
             let question = question.write(true).unwrap();
             for byte in question {
                 message[position] = byte.to_owned();
@@ -94,7 +169,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Header {
     packet_id: u16,
     qr_indicator: bool,
@@ -166,83 +241,20 @@ impl Header {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Question {
     names: Vec<String>,
     q_type: u16,
     class: u16,
+    ttl: u32,
+    length: u16,
+    data: Vec<u8>,
 }
 
 impl Question {
-    fn parse(cursor: &mut Cursor<[u8; 512]>) -> Result<Self> {
-        // let mut buffer = Vec::new();
-        //
-        // cursor
-        //     .read_until(0, &mut buffer)
-        //     .context("Failed to read question buffer")?;
-        //
-        // // Parse labels
-        // let mut label_cursor = Cursor::new(buffer);
-        //
-        // let mut question = Question {
-        //     ..Default::default()
-        // };
-        //
-        // let mut labels = Vec::new();
-        // loop {
-        //     let position = label_cursor.position() as usize;
-        //     if label_cursor.get_ref()[position] == b'\0' {
-        //         break;
-        //     }
-        //     let length = label_cursor.get_u8();
-        //
-        //     let d = [length];
-        //     let mut reader = BitReader::new(&d);
-        //
-        //     let distinguisher = reader.read_u8(2)?;
-        //
-        //     if distinguisher == 11 {
-        //         // Compressed label
-        //         let octet_2 = cursor.get_u8();
-        //         let offset = [reader.read_u8(6)?, octet_2];
-        //
-        //         let cursor_position = cursor.position();
+    fn parse(cursor: &mut Cursor<[u8; 512]>, is_answer: bool) -> Result<Self> {
+        let question = parse_question(cursor, is_answer)?;
 
-        //         let prev_label = u16::from_be_bytes(offset);
-        //
-        //         cursor.set_position(prev_label.into());
-        //         let length = cursor.get_u8();
-        //         let mut label_buf: Vec<u8> = vec![0; length.into()];
-        //
-        //         label_cursor
-        //             .read_exact(&mut label_buf)
-        //             .context("Failed to read label buffer")?;
-        //
-        //         let label = String::from_utf8(label_buf)?;
-        //         labels.push(label);
-        //     } else {
-        //         // NOTE: This handles uncompressed labels
-        //         // Messages having 10 and 01 bits combination will be handled here. not to panic as they
-        //         // are currently restricted for future use.
-        //
-        //         // Uncompressed label
-        //
-        //         let mut label_buf: Vec<u8> = vec![0; length.into()];
-        //
-        //         label_cursor
-        //             .read_exact(&mut label_buf)
-        //             .context("Failed to read label buffer")?;
-        //
-        //         let label = String::from_utf8(label_buf)?;
-        //         labels.push(label);
-        //     }
-        // }
-        // question.names = labels;
-        // let q_type = cursor.get_u16();
-        // let class = cursor.get_u16();
-        // question.q_type = q_type;
-        // question.class = class;
-        let question = parse_question(cursor)?;
         Ok(question)
     }
     fn write(&self, is_answer: bool) -> Result<Vec<u8>> {
@@ -261,14 +273,10 @@ impl Question {
         question = [question, self.class.to_be_bytes().to_vec()].concat();
 
         if is_answer {
-            let ttl: u32 = 60;
-            let length: u16 = 4;
-            let data: [u8; 4] = [10; 4];
+            question = [question, self.ttl.to_be_bytes().to_vec()].concat();
+            question = [question, self.length.to_be_bytes().to_vec()].concat();
 
-            question = [question, ttl.to_be_bytes().to_vec()].concat();
-            question = [question, length.to_be_bytes().to_vec()].concat();
-
-            for section in data {
+            for section in self.data.clone() {
                 question.push(section);
             }
         }
@@ -276,7 +284,7 @@ impl Question {
         Ok(question)
     }
 }
-fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<String> {
+fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<(String, Question)> {
     // Check if pointer
     let octet_1 = cursor.get_u8();
     let octet_1 = [octet_1];
@@ -288,11 +296,11 @@ fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<String> {
         let offset = [reader.read_u8(6)?, octet_2];
         let offset = u16::from_be_bytes(offset);
         let cursor_position = cursor.position();
-
         cursor.set_position(offset.into());
-        let label = parse_label(cursor)?;
+        let question = parse_labels(cursor, Question::default())?;
         cursor.set_position(cursor_position);
-        Ok(label)
+
+        Ok((String::new(), question))
     } else {
         //NOTE: Other including Uncompressed and reserved 01, 10
         //Implements only the uncompressed
@@ -304,26 +312,46 @@ fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<String> {
             .context("Failed to read label buffer")?;
 
         let label = String::from_utf8(label_buf)?;
-        Ok(label)
+        Ok((label, Question::default()))
     }
 }
 
-fn parse_question(cursor: &mut Cursor<[u8; 512]>) -> Result<Question> {
-    let mut question = Question::default();
+fn parse_question(cursor: &mut Cursor<[u8; 512]>, is_answer: bool) -> Result<Question> {
+    let question = Question::default();
+    let mut question = parse_labels(cursor, question)?;
+    let q_type = cursor.get_u16();
+    let class = cursor.get_u16();
+    question.q_type = q_type;
+    question.class = class;
+    if is_answer {
+        question.ttl = cursor.get_u32();
+        question.length = cursor.get_u16();
+        let mut data: Vec<u8> = vec![0; question.length.into()];
+        for index in 0..question.length {
+            data[index as usize] = cursor.get_u8();
+        }
+        question.data = data;
+    }
+
+    Ok(question)
+}
+
+fn parse_labels(cursor: &mut Cursor<[u8; 512]>, mut question: Question) -> Result<Question> {
     loop {
         let position = cursor.position() as usize;
         if cursor.get_ref()[position] == b'\0' {
             break;
         }
+
         let label = parse_label(cursor)?;
-        question.names.push(label);
+        if label.0.is_empty() {
+            // cursor.get_u8();
+            return Ok(label.1);
+        }
+        question.names.push(label.0);
     }
     // Read the null byte
     cursor.get_u8();
-    let q_type = cursor.get_u16();
-    let class = cursor.get_u16();
-    question.q_type = q_type;
-    question.class = class;
 
     Ok(question)
 }
