@@ -1,14 +1,13 @@
 [package]
 name = "codecrafters-dns-server"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
+authors = ["George Thuo Kariuki <kariukigeorge2030@gmail.com>"]
 edition = "2021"
 rust-version = "1.80"
 
 [dependencies]
 anyhow = "1.0.68"                                # error handling
 bitreader = "0.3.8"
-bitvec = "1.0.1"
 bytes = "1.3.0"                                  # helps manage buffers
 rust-bitwriter = "0.0.1"
 thiserror = "1.0.38"                             # error handling

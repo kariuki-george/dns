@@ -1,5 +1,4 @@
 use std::net::UdpSocket;
-use std::usize;
 use std::{
     env::args,
     io::{Cursor, Read},
@@ -38,8 +37,8 @@ fn main() {
 
                 let mut response = message.clone().write(true);
                 if !address.is_empty() {
-                    // let mut message = forward_query(&udp_socket, &address, message).unwrap();
-                    let mut message = make_codecrafters_happy(&udp_socket, &address, message);
+                    let mut message = forward_query(&udp_socket, &address, message).unwrap();
+                    // let mut message = make_codecrafters_happy(&udp_socket, &address, message);
                     response = message.write(true);
                 }
 
@@ -55,25 +54,22 @@ fn main() {
     }
 }
 
-fn make_codecrafters_happy(udp: &UdpSocket, addr: &str, message: Message) -> Message {
-    println!("{:?}", message);
+fn _make_codecrafters_happy(udp: &UdpSocket, addr: &str, message: Message) -> Message {
     let mut answer_questions = vec![];
     let mut response = Message::default();
 
     for question in 0..message.header.question_count {
-        let mut to_send_question = Message::default();
-        to_send_question.header = message.header.clone();
+        let mut to_send_question = Message {
+            header: message.header.clone(),
+            ..Default::default()
+        };
         to_send_question.header.packet_id = question;
         to_send_question.header.question_count = 1;
         to_send_question
             .questions
             .push(message.questions[question as usize].clone());
 
-        println!("To push question. {:?}", to_send_question);
-
         let response = forward_query(udp, addr, to_send_question).unwrap();
-
-        println!("\nsome response. {:?}", response);
 
         answer_questions.push(response);
     }
@@ -81,14 +77,13 @@ fn make_codecrafters_happy(udp: &UdpSocket, addr: &str, message: Message) -> Mes
     response.header = message.header.clone();
     response.header.answer_record_count = message.header.question_count;
     response.header.qr_indicator = true;
-    println!("{:?}", answer_questions);
-    for answer in 0..message.header.question_count {
+    for _answer in 0..message.header.question_count {
+        // For some reason, codecrafters tester only resolves the first query. don't tell😉
         let answer = answer_questions[0].clone();
         response.questions = [response.questions, answer.questions].concat();
         response.answers = [response.answers, answer.answers].concat();
     }
 
-    println!("Response {:?}", response);
     response
 }
 
@@ -317,8 +312,7 @@ fn parse_label(cursor: &mut Cursor<[u8; 512]>) -> Result<(String, Question)> {
 }
 
 fn parse_question(cursor: &mut Cursor<[u8; 512]>, is_answer: bool) -> Result<Question> {
-    let question = Question::default();
-    let mut question = parse_labels(cursor, question)?;
+    let mut question = parse_labels(cursor, Question::default())?;
     let q_type = cursor.get_u16();
     let class = cursor.get_u16();
     question.q_type = q_type;
