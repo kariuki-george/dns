@@ -339,7 +339,6 @@ fn parse_labels(cursor: &mut Cursor<[u8; 512]>, mut question: Question) -> Resul
 
         let label = parse_label(cursor)?;
         if label.0.is_empty() {
-            // cursor.get_u8();
             return Ok(label.1);
         }
         question.names.push(label.0);
